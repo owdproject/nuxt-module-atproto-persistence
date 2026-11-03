@@ -1,76 +1,62 @@
 import { useAtprotoSession } from '#imports'
 import { useRouter, useRuntimeConfig } from 'nuxt/app'
-import { loadActorDesktopStateMap } from './utilAtprotoApplicationStates'
+import {
+  loadActorDesktopStateMap,
+  resolveDesktopId,
+} from './utilAtprotoApplicationStates'
 
-const ATPROTO_READY_TIMEOUT_MS = 2000
-const ATPROTO_READY_POLL_MS = 10
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-/** Wait until the nuxt-atproto plugin has finished OAuth init (or timeout as guest). */
-export async function waitForAtprotoReady(nuxtApp: any): Promise<void> {
-  const deadline = Date.now() + ATPROTO_READY_TIMEOUT_MS
-
-  while (Date.now() < deadline) {
-    const $atproto = nuxtApp.$atproto
-    if ($atproto && $atproto.status.value !== 'initializing') {
-      return
-    }
-    await sleep(ATPROTO_READY_POLL_MS)
-  }
-}
-
-export async function resolveRestoreActorDid(nuxtApp: any): Promise<string | undefined> {
+export async function resolveRestoreActorDid(
+  nuxtApp: any,
+): Promise<string | undefined> {
   const router = nuxtApp.runWithContext(() => useRouter())
   await router.isReady()
-
   const routeDid = router.currentRoute.value.params.did
-  if (typeof routeDid === 'string' && routeDid.length > 0) {
-    return routeDid
-  }
+  if (typeof routeDid === 'string' && routeDid.length > 0) return routeDid
+  if (!nuxtApp.$atproto) return undefined
 
-  const { isLogged, session } = nuxtApp.runWithContext(() => useAtprotoSession())
-  if (isLogged.value && session.value?.sub) {
-    return session.value.sub
-  }
+  const { isLogged, session } = nuxtApp.runWithContext(() =>
+    useAtprotoSession(),
+  )
+  if (isLogged.value && session.value?.sub) return session.value.sub
 
-  const runtimeConfig = nuxtApp.runWithContext(() => useRuntimeConfig())
-  const desktop = runtimeConfig.public.desktop as {
-    atprotoPersistence?: { loadOwnerDesktopOnMounted?: boolean }
-    atprotoDesktop?: { owner?: { did?: string } }
-  }
-
-  if (desktop.atprotoPersistence?.loadOwnerDesktopOnMounted) {
+  const desktop = nuxtApp.runWithContext(() => useRuntimeConfig()).public
+    .desktop as any
+  if (desktop.atprotoPersistence?.loadOwnerDesktopOnMounted)
     return desktop.atprotoDesktop?.owner?.did
-  }
-
   return undefined
 }
 
-let actorStatesPromise: Promise<Record<string, unknown>> | null = null
+// Per Nuxt app and actor, not a module-global promise shared by unrelated hosts.
+// Failed reads are never cached, so online/session hooks can retry them.
+const loads = new WeakMap<
+  object,
+  Map<string, Promise<Record<string, unknown>>>
+>()
 
-async function loadActorStatesOnce(nuxtApp: any): Promise<Record<string, unknown>> {
-  await waitForAtprotoReady(nuxtApp)
-
+export async function ensureActorStatesLoaded(
+  nuxtApp: any,
+  refresh = false,
+): Promise<Record<string, unknown>> {
   const actorDid = await resolveRestoreActorDid(nuxtApp)
-  if (!actorDid) {
-    return {}
+  if (!actorDid) return {}
+  const desktopId = resolveDesktopId(nuxtApp)
+  let cache = loads.get(nuxtApp)
+  if (!cache) loads.set(nuxtApp, (cache = new Map()))
+  const key = `${desktopId}/${actorDid}`
+  if (refresh) cache.delete(key)
+  if (!cache.has(key)) {
+    const task = loadActorDesktopStateMap(nuxtApp, actorDid, desktopId).catch(
+      (error) => {
+        cache!.delete(key)
+        throw error
+      },
+    )
+    cache.set(key, task)
   }
-
-  try {
-    const states = await loadActorDesktopStateMap(nuxtApp, actorDid)
-    return states
-  } catch (err) {
-    return {}
-  }
+  return cache.get(key)!
 }
 
-/** One remote fetch per boot; subsequent getItem calls reuse the same promise. */
-export function ensureActorStatesLoaded(nuxtApp: any): Promise<Record<string, unknown>> {
-  if (!actorStatesPromise) {
-    actorStatesPromise = loadActorStatesOnce(nuxtApp)
-  }
-  return actorStatesPromise
+/** Invalidate this host's remote profile when its account signs out. */
+export function invalidateActorStates(nuxtApp: object): void {
+  loads.delete(nuxtApp)
 }
